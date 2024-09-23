@@ -1,13 +1,13 @@
 """Minimal implementation of CLIPVisionModel intended to be only used
 within a vision language model."""
-from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
 from transformers import CLIPVisionConfig
-from xformers import ops as xops
+from transformers.models.clip.modeling_clip import CLIPSdpaAttention
 
 from vllm.config import ModelConfig
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
@@ -20,7 +20,13 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal.utils import (cached_get_tokenizer,
                                    repeat_and_pad_placeholder_tokens)
-from vllm.sequence import VLLM_TOKEN_ID_ARRAY_TYPE, SequenceData
+from vllm.sequence import SequenceData
+
+try:
+    from xformers import ops as xops
+    USE_XFORMERS_OPS = True
+except ImportError:
+    USE_XFORMERS_OPS = False
 
 
 def get_clip_patch_grid_length(*, image_size: int, patch_size: int) -> int:
@@ -56,11 +62,10 @@ def dummy_seq_data_for_clip(
     else:
         image_feature_size = image_feature_size_override
 
-    token_ids = array(VLLM_TOKEN_ID_ARRAY_TYPE,
-                      [image_token_id]) * image_feature_size * num_images
-    token_ids += array(VLLM_TOKEN_ID_ARRAY_TYPE,
-                       [0]) * (seq_len - image_feature_size * num_images)
-    return SequenceData(token_ids)
+    return SequenceData.from_token_counts(
+        (image_token_id, image_feature_size * num_images),
+        (0, seq_len - image_feature_size * num_images),
+    )
 
 
 def dummy_image_for_clip(
@@ -78,6 +83,24 @@ def dummy_image_for_clip(
 
     image = Image.new("RGB", (width, height), color=0)
     return {"image": image if num_images == 1 else [image] * num_images}
+
+
+def dummy_video_for_clip(
+    hf_config: CLIPVisionConfig,
+    num_frames: int,
+    *,
+    image_width_override: Optional[int] = None,
+    image_height_override: Optional[int] = None,
+):
+    pil_frame = dummy_image_for_clip(
+        hf_config,
+        num_images=1,
+        image_width_override=image_width_override,
+        image_height_override=image_height_override)
+    np_frame = np.array(pil_frame["image"])
+    mm_data_per_video = np.repeat([np_frame], num_frames, axis=0)
+    mm_data = {"video": mm_data_per_video}
+    return mm_data
 
 
 def input_processor_for_clip(
@@ -99,7 +122,7 @@ def input_processor_for_clip(
         if isinstance(image_data, Image.Image):
             image_feature_size = get_clip_image_feature_size(hf_config)
         elif isinstance(image_data, torch.Tensor):
-            image_feature_size = image_data.shape[0]
+            num_images, image_feature_size, hidden_size = image_data.shape
         else:
             raise TypeError(f"Invalid image type: {type(image_data)}")
     else:
@@ -162,7 +185,7 @@ class CLIPVisionEmbeddings(nn.Module):
         return embeddings
 
 
-class CLIPAttention(nn.Module):
+class CLIPParallelAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
@@ -231,7 +254,7 @@ class CLIPAttention(nn.Module):
         out = out.view(bsz, tgt_len, -1)
         attn_output, _ = self.out_proj(out)
 
-        return attn_output
+        return attn_output, None
 
 
 class CLIPMLP(nn.Module):
@@ -266,7 +289,13 @@ class CLIPEncoderLayer(nn.Module):
                  quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
 
-        self.self_attn = CLIPAttention(config, quant_config=quant_config)
+        num_heads = config.num_attention_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        if USE_XFORMERS_OPS and num_heads % tp_size == 0:
+            self.self_attn = CLIPParallelAttention(config,
+                                                   quant_config=quant_config)
+        else:
+            self.self_attn = CLIPSdpaAttention(config)
         self.layer_norm1 = nn.LayerNorm(config.hidden_size,
                                         eps=config.layer_norm_eps)
         self.mlp = CLIPMLP(config, quant_config=quant_config)
@@ -278,7 +307,7 @@ class CLIPEncoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states=hidden_states)
+        hidden_states, _ = self.self_attn(hidden_states=hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -343,6 +372,19 @@ class CLIPVisionTransformer(nn.Module):
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers_override)
 
+        if len(self.encoder.layers) > config.num_hidden_layers:
+            raise ValueError(
+                f"The original encoder only has {config.num_hidden_layers} "
+                f"layers, but you requested {len(self.encoder.layers)} layers."
+            )
+        elif len(self.encoder.layers) == config.num_hidden_layers:
+            self.post_layernorm = nn.LayerNorm(embed_dim,
+                                               eps=config.layer_norm_eps)
+        else:
+            # post_layernorm is unused when we extract intermediate features
+            # In this case, we can skip it to conserve memory
+            self.post_layernorm = None
+
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -352,7 +394,10 @@ class CLIPVisionTransformer(nn.Module):
         hidden_states = self.pre_layrnorm(hidden_states)
         hidden_states = self.encoder(inputs_embeds=hidden_states)
 
-        return hidden_states
+        if self.post_layernorm is None:
+            return hidden_states
+
+        return self.post_layernorm(hidden_states)
 
 
 class CLIPVisionModel(nn.Module):
@@ -365,14 +410,18 @@ class CLIPVisionModel(nn.Module):
                  quant_config: Optional[QuantizationConfig] = None,
                  num_hidden_layers_override: Optional[int] = None):
         super().__init__()
+
+        tp_size = get_tensor_model_parallel_world_size()
+        num_heads = config.num_attention_heads
+        self.shard_weight = USE_XFORMERS_OPS and num_heads % tp_size == 0
+
         self.vision_model = CLIPVisionTransformer(
             config=config,
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers_override)
 
-    def forward(self, pixel_values: Optional[torch.Tensor] = None):
-
-        return self.vision_model(pixel_values=pixel_values)
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.vision_model(pixel_values)
 
     @property
     def device(self):
@@ -386,16 +435,18 @@ class CLIPVisionModel(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
-        ]
+        ] if self.shard_weight else []
         params_dict = dict(self.named_parameters())
         layer_count = len(self.vision_model.encoder.layers)
 
         for name, loaded_weight in weights:
             # post_layernorm is not needed in CLIPVisionModel
-            if "vision_model.post_layernorm" in name:
+            if (name.startswith("vision_model.post_layernorm")
+                    and self.vision_model.post_layernorm is None):
                 continue
+
             # omit layers when num_hidden_layers_override is set
-            if "vision_model.encoder.layers." in name:
+            if name.startswith("vision_model.encoder.layers"):
                 layer_idx = int(name.split(".")[3])
                 if layer_idx >= layer_count:
                     continue
