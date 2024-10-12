@@ -179,7 +179,7 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
     --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install dist/*.whl --verbose
 
-COPY ../flashinfer-0.1.6+cu121torch2.4-cp312-cp312-linux_x86_64.whl .
+COPY /home/stormwine/flashinfer-0.1.6+cu121torch2.4-cp312-cp312-linux_x86_64.whl .
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     . /etc/environment && \
